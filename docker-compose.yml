@@ -1,0 +1,109 @@
+services:
+  # ── PostgreSQL + pgvector ─────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cie_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cie_user
+      POSTGRES_PASSWORD: cie_password
+      POSTGRES_DB: contract_intelligence
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cie_user -d contract_intelligence"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── FastMCP Server (legal precedent tool server) ─────────────────────────
+  mcp_server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cie_mcp_server
+    restart: unless-stopped
+    command: python mcp_server/server.py
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://cie_user:cie_password@postgres:5432/contract_intelligence
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      MCP_PORT: 8001
+      LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl http://127.0.0.1:8001/mcp || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── FastAPI Backend (LangGraph orchestrator) ──────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cie_backend
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level info
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://cie_user:cie_password@postgres:5432/contract_intelligence
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      MCP_SERVER_URL: http://mcp_server:8001/mcp
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-1.5-flash}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      EMBEDDING_MODEL: models/text-embedding-004
+      ESCALATION_THRESHOLD: 40
+      MAX_EXTRACTION_RETRIES: 3
+      LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mcp_server:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ── Next.js Dashboard ─────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cie_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_BACKEND_URL: http://localhost:8000
+      # Use internal docker URL for server-side API proxy
+      BACKEND_URL_INTERNAL: http://backend:8000
+      NODE_ENV: production
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  default:
+    name: cie_network
